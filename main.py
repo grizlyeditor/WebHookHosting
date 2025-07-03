@@ -1,18 +1,39 @@
-import os
-import telebot
-import json
-import subprocess
-import shutil
-import requests
+# main.py
+
+import os, time, json, shutil, subprocess, threading, requests, psutil
 from flask import Flask, request
-from telebot.types import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+import telebot
+from telebot.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
-hosting = {}
+hosting = {}  # user_id → step, folder, etc.
+
+# ========== ROUTES ========== #
+
+@app.route('/')
+def home():
+    return "✅ Webhook Bot is Live"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        update = telebot.types.Update.de_json(request.get_data().decode('utf-8'))
+        bot.process_new_updates([update])
+        return 'ok'
+    return 'forbidden', 403
+
+@app.before_first_request
+def setup_webhook():
+    time.sleep(1)
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL)
+    print(f"✅ Webhook set to {WEBHOOK_URL}")
+
+# ========== TELEGRAM BOT HANDLERS ========== #
 
 def make_user_dir(uid):
     folder = f"hostings/user_{uid}"
@@ -23,7 +44,7 @@ def make_user_dir(uid):
 def start(m):
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("💻 Hosting", "🔑 JWT Token Generator")
-    bot.send_message(m.chat.id, "👋 Welcome! Choose an option:", reply_markup=kb)
+    bot.send_message(m.chat.id, "👋 Welcome to Webhook Hosting Bot!", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "💻 Hosting")
 def ask_time(m):
@@ -47,24 +68,22 @@ def select_time(call):
     value = call.data.split("_")[1]
     if value == "custom":
         hosting[uid]["step"] = "custom"
-        bot.send_message(call.message.chat.id, "✍️ Send custom time (in minutes):")
+        bot.send_message(call.message.chat.id, "⏳ Send custom time in minutes:")
     else:
-        mins = int(value)
-        start_file_upload(call.message.chat.id, uid, mins)
+        start_file_upload(call.message.chat.id, uid, int(value))
 
 @bot.message_handler(func=lambda m: m.from_user.id in hosting and hosting[m.from_user.id]["step"] == "custom")
-def receive_custom_minutes(m):
-    uid = m.from_user.id
+def custom_minutes(m):
     try:
         mins = int(m.text.strip())
-        start_file_upload(m.chat.id, uid, mins)
+        start_file_upload(m.chat.id, m.from_user.id, mins)
     except:
-        bot.send_message(m.chat.id, "❌ Invalid number. Send only numbers like `30`, `120`, etc.")
+        bot.send_message(m.chat.id, "❌ Invalid number. Please send only digits like `60`, `120`")
 
 def start_file_upload(chat_id, uid, mins):
     folder = make_user_dir(uid)
     hosting[uid].update({"step": "upload", "minutes": mins, "folder": folder, "files": []})
-    bot.send_message(chat_id, f"⏳ Hosting for `{mins} minutes`\n📤 Send your `.py` and other files\n✅ Type `done` when ready.")
+    bot.send_message(chat_id, f"📤 Send your `.py` and other required files\n✅ Type `done` when you're ready.")
 
 @bot.message_handler(content_types=['document'])
 def save_file(m):
@@ -77,11 +96,14 @@ def save_file(m):
     file_path = os.path.join(folder, m.document.file_name)
     with open(file_path, "wb") as f:
         f.write(data)
-    hosting[uid]["files"].append(m.document.file_name)
-    bot.send_message(m.chat.id, f"✅ Saved `{m.document.file_name}`")
+    if step == "upload":
+        hosting[uid]["files"].append(m.document.file_name)
+        bot.send_message(m.chat.id, f"✅ Saved `{m.document.file_name}`")
+    elif step == "jwt":
+        handle_jwt_file(m, file_path)
 
 @bot.message_handler(func=lambda m: m.text.lower() == "done")
-def run_script(m):
+def run_uploaded(m):
     uid = m.from_user.id
     if uid not in hosting or hosting[uid]["step"] != "upload":
         return
@@ -91,29 +113,29 @@ def run_script(m):
         bot.send_message(m.chat.id, "❌ No `.py` file found.")
         return
     main_file = py_files[0]
-    main_path = os.path.join(folder, main_file)
-
     try:
-        with open(main_path, 'rb') as f:
-            files = {'file': (main_file, f)}
-            data = {'uid': uid, 'minutes': hosting[uid]['minutes']}
-            r = requests.post(WEBHOOK_URL + "/webhook", data=data, files=files)
-        if r.status_code == 200:
-            result = r.json()
-            output = result.get("output", result.get("error", "No output"))
-            bot.send_message(m.chat.id, f"✅ Hosted via Webhook\n📤 Output:\n```\n{output[:4000]}\n```", parse_mode="Markdown")
-        else:
-            bot.send_message(m.chat.id, f"❌ Webhook Error: {r.status_code}")
+        proc = subprocess.Popen(["python3", main_file], cwd=folder)
+        end = time.time() + hosting[uid]['minutes'] * 60
+        hosting[uid].update({"step": "running", "process": proc, "end": end})
+        bot.send_message(m.chat.id, f"✅ Running `{main_file}` for {hosting[uid]['minutes']} minutes")
+        threading.Thread(target=auto_kill, args=(uid,)).start()
     except Exception as e:
-        bot.send_message(m.chat.id, f"❌ Exception: {e}")
+        bot.send_message(m.chat.id, f"❌ Error: {e}")
 
+def auto_kill(uid):
+    while time.time() < hosting[uid]['end']:
+        time.sleep(5)
     try:
-        shutil.rmtree(folder)
-    except:
-        pass
+        proc = hosting[uid]['process']
+        if psutil.pid_exists(proc.pid):
+            proc.kill()
+        shutil.rmtree(hosting[uid]["folder"])
+        bot.send_message(uid, "⛔ Time finished. Hosting ended.")
+    except Exception as e:
+        bot.send_message(uid, f"⚠️ Error during cleanup: {e}")
     hosting.pop(uid, None)
 
-# ===== JWT Generator =====
+# ========== JWT TOKEN GEN ==========
 @bot.message_handler(func=lambda m: m.text == "🔑 JWT Token Generator")
 def ask_jwt(m):
     uid = m.from_user.id
@@ -126,25 +148,24 @@ def handle_jwt_file(m, path):
     bot.send_message(m.chat.id, "⚙️ Generating tokens...")
     try:
         creds = json.load(open(path))
-        output = []
-        log = []
+        output, log = [], []
         for user in creds:
             uid_val = user.get("uid")
             pwd = user.get("password")
             if not uid_val or not pwd:
-                log.append(f"❌ Skipped invalid entry")
+                log.append("❌ Invalid entry")
                 continue
-            url = f"https://jw-ttoken.vercel.app/token?uid={uid_val}&password={pwd}"
             try:
-                r = requests.get(url, timeout=10)
-                if r.status_code == 200:
-                    token = r.text.strip()
+                r = requests.get(f"https://jw-ttoken.vercel.app/token?uid={uid_val}&password={pwd}", timeout=10)
+                token = r.text.strip() if r.status_code == 200 else "ERR"
+                if token != "ERR":
                     output.append({"uid": uid_val, "token": token})
                     log.append(f"✅ {uid_val}")
                 else:
-                    log.append(f"❌ {uid_val} (code {r.status_code})")
+                    log.append(f"❌ {uid_val}")
             except:
-                log.append(f"⚠️ {uid_val} (request error)")
+                log.append(f"⚠️ {uid_val} (request fail)")
+
         out_path = os.path.join(hosting[uid]["folder"], "tokens.json")
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2)
@@ -154,17 +175,6 @@ def handle_jwt_file(m, path):
         bot.send_message(m.chat.id, f"❌ Error: {e}")
     hosting.pop(uid, None)
 
-# ==== Webhook Route ====
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_str = request.get_data().decode('utf-8')
-        update = Update.de_json(json_str)
-        bot.process_new_updates([update])
-    return 'OK', 200
-
-# ==== Start App + Webhook ====
+# ========== RUN APP ========== #
 if __name__ == "__main__":
-    bot.remove_webhook()
-    bot.set_webhook(url=WEBHOOK_URL + "/webhook")
     app.run(host="0.0.0.0", port=10000)
