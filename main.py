@@ -1,19 +1,34 @@
 import telebot, os, subprocess, time, threading, shutil, psutil, json, requests
+from flask import Flask, request
 from telebot.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-
-if not BOT_TOKEN:
-    raise Exception("BOT_TOKEN missing from environment")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # eg: https://your-render-url.onrender.com
 
 bot = telebot.TeleBot(BOT_TOKEN)
-hosting = {}  # user_id → step, files, etc.
+hosting = {}
+
+app = Flask(__name__)
 
 def make_user_dir(uid):
     folder = f"hostings/user_{uid}"
     os.makedirs(folder, exist_ok=True)
     return folder
+
+@app.route('/')
+def index():
+    return "✅ Bot is alive!"
+
+@app.route("/webhook", methods=['POST'])
+def webhook():
+    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
+    bot.process_new_updates([update])
+    return "ok"
+
+@app.before_first_request
+def set_webhook():
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL + "/webhook")
 
 @bot.message_handler(commands=['start'])
 def start(m):
@@ -29,10 +44,8 @@ def ask_time(m):
     kb.add(
         InlineKeyboardButton("⏱ 1 Hour", callback_data="host_60"),
         InlineKeyboardButton("📆 1 Day", callback_data="host_1440"),
-    )
-    kb.add(
         InlineKeyboardButton("🗓 7 Days", callback_data="host_10080"),
-        InlineKeyboardButton("📅 1 Month", callback_data="host_43200"),
+        InlineKeyboardButton("📅 1 Month", callback_data="host_43200")
     )
     kb.add(InlineKeyboardButton("🧮 Custom Minutes", callback_data="host_custom"))
     bot.send_message(m.chat.id, "🕒 Select hosting time:", reply_markup=kb)
@@ -93,25 +106,30 @@ def run_script(m):
     main_path = os.path.join(folder, main_file)
 
     try:
-        with open(main_path, 'rb') as f:
-            files = {'file': (main_file, f)}
-            data = {'uid': uid, 'minutes': hosting[uid]['minutes']}
-            r = requests.post(WEBHOOK_URL, data=data, files=files)
-        if r.status_code == 200:
-            result = r.json()
-            output = result.get("output", result.get("error", "No output"))
-            bot.send_message(m.chat.id, f"✅ Hosted via Webhook\n📤 Output:\n```\n{output[:4000]}\n```", parse_mode="Markdown")
-        else:
-            bot.send_message(m.chat.id, f"❌ Webhook Error: {r.status_code}")
+        proc = subprocess.Popen(["python3", main_file], cwd=folder)
+        end_time = time.time() + hosting[uid]["minutes"] * 60
+        hosting[uid].update({"step": "running", "process": proc, "end": end_time})
+        bot.send_message(m.chat.id, f"✅ Running `{main_file}`\n🕒 Will auto stop in {hosting[uid]['minutes']} minutes.")
+        threading.Thread(target=expire_hosting, args=(uid,)).start()
     except Exception as e:
-        bot.send_message(m.chat.id, f"❌ Exception: {e}")
+        bot.send_message(m.chat.id, f"❌ Error: {e}")
 
+def expire_hosting(uid):
+    while time.time() < hosting[uid]["end"]:
+        time.sleep(5)
     try:
-        shutil.rmtree(folder)
-    except:
-        pass
+        proc = hosting[uid]["process"]
+        if psutil.pid_exists(proc.pid):
+            proc.kill()
+        folder = hosting[uid]["folder"]
+        if os.path.exists(folder):
+            shutil.rmtree(folder)
+        bot.send_message(uid, "⛔ Hosting time ended. Bot stopped. Folder deleted.")
+    except Exception as e:
+        bot.send_message(uid, f"⚠️ Error while stopping bot: {e}")
     hosting.pop(uid, None)
 
+# ===== 🔑 JWT TOKEN GENERATOR =====
 @bot.message_handler(func=lambda m: m.text == "🔑 JWT Token Generator")
 def ask_jwt(m):
     uid = m.from_user.id
@@ -153,4 +171,6 @@ def handle_jwt_file(m, path):
         bot.send_message(m.chat.id, f"❌ Error: {e}")
     hosting.pop(uid, None)
 
-bot.infinity_polling()
+# Flask App Run (for Render)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
