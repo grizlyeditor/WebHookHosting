@@ -1,34 +1,23 @@
-import telebot, os, subprocess, time, threading, shutil, psutil, json, requests
+import os
+import telebot
+import json
+import subprocess
+import shutil
+import requests
 from flask import Flask, request
-from telebot.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from telebot.types import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # eg: https://your-render-url.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 bot = telebot.TeleBot(BOT_TOKEN)
-hosting = {}
-
 app = Flask(__name__)
+hosting = {}
 
 def make_user_dir(uid):
     folder = f"hostings/user_{uid}"
     os.makedirs(folder, exist_ok=True)
     return folder
-
-@app.route('/')
-def index():
-    return "✅ Bot is alive!"
-
-@app.route("/webhook", methods=['POST'])
-def webhook():
-    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-    bot.process_new_updates([update])
-    return "ok"
-
-@app.before_first_request
-def set_webhook():
-    bot.remove_webhook()
-    bot.set_webhook(url=WEBHOOK_URL + "/webhook")
 
 @bot.message_handler(commands=['start'])
 def start(m):
@@ -44,8 +33,10 @@ def ask_time(m):
     kb.add(
         InlineKeyboardButton("⏱ 1 Hour", callback_data="host_60"),
         InlineKeyboardButton("📆 1 Day", callback_data="host_1440"),
+    )
+    kb.add(
         InlineKeyboardButton("🗓 7 Days", callback_data="host_10080"),
-        InlineKeyboardButton("📅 1 Month", callback_data="host_43200")
+        InlineKeyboardButton("📅 1 Month", callback_data="host_43200"),
     )
     kb.add(InlineKeyboardButton("🧮 Custom Minutes", callback_data="host_custom"))
     bot.send_message(m.chat.id, "🕒 Select hosting time:", reply_markup=kb)
@@ -68,12 +59,12 @@ def receive_custom_minutes(m):
         mins = int(m.text.strip())
         start_file_upload(m.chat.id, uid, mins)
     except:
-        bot.send_message(m.chat.id, "❌ Invalid number. Please send only numbers like `30`, `120`, etc.")
+        bot.send_message(m.chat.id, "❌ Invalid number. Send only numbers like `30`, `120`, etc.")
 
 def start_file_upload(chat_id, uid, mins):
     folder = make_user_dir(uid)
     hosting[uid].update({"step": "upload", "minutes": mins, "folder": folder, "files": []})
-    bot.send_message(chat_id, f"⏳ Hosting for `{mins} minutes`\n📤 Send your `.py` and any required files\n✅ Type `done` when you're ready.")
+    bot.send_message(chat_id, f"⏳ Hosting for `{mins} minutes`\n📤 Send your `.py` and other files\n✅ Type `done` when ready.")
 
 @bot.message_handler(content_types=['document'])
 def save_file(m):
@@ -86,11 +77,8 @@ def save_file(m):
     file_path = os.path.join(folder, m.document.file_name)
     with open(file_path, "wb") as f:
         f.write(data)
-    if step == "upload":
-        hosting[uid]["files"].append(m.document.file_name)
-        bot.send_message(m.chat.id, f"✅ Saved `{m.document.file_name}`")
-    elif step == "jwt":
-        handle_jwt_file(m, file_path)
+    hosting[uid]["files"].append(m.document.file_name)
+    bot.send_message(m.chat.id, f"✅ Saved `{m.document.file_name}`")
 
 @bot.message_handler(func=lambda m: m.text.lower() == "done")
 def run_script(m):
@@ -106,30 +94,26 @@ def run_script(m):
     main_path = os.path.join(folder, main_file)
 
     try:
-        proc = subprocess.Popen(["python3", main_file], cwd=folder)
-        end_time = time.time() + hosting[uid]["minutes"] * 60
-        hosting[uid].update({"step": "running", "process": proc, "end": end_time})
-        bot.send_message(m.chat.id, f"✅ Running `{main_file}`\n🕒 Will auto stop in {hosting[uid]['minutes']} minutes.")
-        threading.Thread(target=expire_hosting, args=(uid,)).start()
+        with open(main_path, 'rb') as f:
+            files = {'file': (main_file, f)}
+            data = {'uid': uid, 'minutes': hosting[uid]['minutes']}
+            r = requests.post(WEBHOOK_URL + "/webhook", data=data, files=files)
+        if r.status_code == 200:
+            result = r.json()
+            output = result.get("output", result.get("error", "No output"))
+            bot.send_message(m.chat.id, f"✅ Hosted via Webhook\n📤 Output:\n```\n{output[:4000]}\n```", parse_mode="Markdown")
+        else:
+            bot.send_message(m.chat.id, f"❌ Webhook Error: {r.status_code}")
     except Exception as e:
-        bot.send_message(m.chat.id, f"❌ Error: {e}")
+        bot.send_message(m.chat.id, f"❌ Exception: {e}")
 
-def expire_hosting(uid):
-    while time.time() < hosting[uid]["end"]:
-        time.sleep(5)
     try:
-        proc = hosting[uid]["process"]
-        if psutil.pid_exists(proc.pid):
-            proc.kill()
-        folder = hosting[uid]["folder"]
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-        bot.send_message(uid, "⛔ Hosting time ended. Bot stopped. Folder deleted.")
-    except Exception as e:
-        bot.send_message(uid, f"⚠️ Error while stopping bot: {e}")
+        shutil.rmtree(folder)
+    except:
+        pass
     hosting.pop(uid, None)
 
-# ===== 🔑 JWT TOKEN GENERATOR =====
+# ===== JWT Generator =====
 @bot.message_handler(func=lambda m: m.text == "🔑 JWT Token Generator")
 def ask_jwt(m):
     uid = m.from_user.id
@@ -161,7 +145,6 @@ def handle_jwt_file(m, path):
                     log.append(f"❌ {uid_val} (code {r.status_code})")
             except:
                 log.append(f"⚠️ {uid_val} (request error)")
-
         out_path = os.path.join(hosting[uid]["folder"], "tokens.json")
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2)
@@ -171,6 +154,17 @@ def handle_jwt_file(m, path):
         bot.send_message(m.chat.id, f"❌ Error: {e}")
     hosting.pop(uid, None)
 
-# Flask App Run (for Render)
+# ==== Webhook Route ====
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_str = request.get_data().decode('utf-8')
+        update = Update.de_json(json_str)
+        bot.process_new_updates([update])
+    return 'OK', 200
+
+# ==== Start App + Webhook ====
 if __name__ == "__main__":
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL + "/webhook")
     app.run(host="0.0.0.0", port=10000)
