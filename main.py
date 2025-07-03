@@ -1,8 +1,11 @@
 import telebot, os, subprocess, time, threading, shutil, psutil, json, requests
 from telebot.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 
-BOT_TOKEN = os.environ.get("7718570853:AAGLRnxyQ-GJm2qvmQ7VXC-WEzgdK6DBQ1I")  # Must be set in .env or Render env
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Example: https://yourapi.onrender.com/webhook
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+
+if not BOT_TOKEN:
+    raise Exception("BOT_TOKEN missing from environment")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 hosting = {}  # user_id → step, files, etc.
@@ -103,14 +106,12 @@ def run_script(m):
     except Exception as e:
         bot.send_message(m.chat.id, f"❌ Exception: {e}")
 
-    # Clean up
     try:
         shutil.rmtree(folder)
     except:
         pass
     hosting.pop(uid, None)
 
-# ===== 🔑 JWT TOKEN GENERATOR =====
 @bot.message_handler(func=lambda m: m.text == "🔑 JWT Token Generator")
 def ask_jwt(m):
     uid = m.from_user.id
@@ -152,5 +153,4 @@ def handle_jwt_file(m, path):
         bot.send_message(m.chat.id, f"❌ Error: {e}")
     hosting.pop(uid, None)
 
-# Start polling
 bot.infinity_polling()
