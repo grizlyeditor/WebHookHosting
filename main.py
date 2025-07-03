@@ -9,7 +9,7 @@ BOT_TOKEN = '7718570853:AAGLRnxyQ-GJm2qvmQ7VXC-WEzgdK6DBQ1I'
 bot = telebot.TeleBot(BOT_TOKEN)
 hosting = {}
 
-WEBHOOK_URL = "https://your-domain.com"  # ⚠️ Replace with your deployed domain
+WEBHOOK_URL = "https://webhookhosting-4.onrender.com/"  # ⚠️ Replace with your deployed domain
 WEBHOOK_SECRET = "supersecret"
 
 app = Flask(__name__)
