@@ -1,35 +1,23 @@
-# hosting_bot_final_webhook.py
+import telebot, os, subprocess, time, threading, shutil, psutil, json, requests
+from telebot.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 
-import telebot, os, subprocess, time, threading, shutil, psutil
-from flask import Flask, request
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+BOT_TOKEN = os.environ.get("7718570853:AAGLRnxyQ-GJm2qvmQ7VXC-WEzgdK6DBQ1I")  # Must be set in .env or Render env
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Example: https://yourapi.onrender.com/webhook
 
-# === BOT CONFIG ===
-BOT_TOKEN = '7718570853:AAGLRnxyQ-GJm2qvmQ7VXC-WEzgdK6DBQ1I'
 bot = telebot.TeleBot(BOT_TOKEN)
-hosting = {}
+hosting = {}  # user_id → step, files, etc.
 
-WEBHOOK_URL = "https://webhookhosting-4.onrender.com/"  # ⚠️ Replace with your deployed domain
-WEBHOOK_SECRET = "supersecret"
+def make_user_dir(uid):
+    folder = f"hostings/user_{uid}"
+    os.makedirs(folder, exist_ok=True)
+    return folder
 
-app = Flask(__name__)
-
-# === TELEGRAM WEBHOOK ROUTE ===
-@app.route(f"/{WEBHOOK_SECRET}", methods=["POST"])
-def webhook():
-    json_str = request.get_data().decode("utf-8")
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "!", 200
-
-# === START HANDLER ===
 @bot.message_handler(commands=['start'])
 def start(m):
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("💻 Hosting"))
-    bot.send_message(m.chat.id, "👋 Welcome to Hosting Panel!", reply_markup=kb)
+    kb.add("💻 Hosting", "🔑 JWT Token Generator")
+    bot.send_message(m.chat.id, "👋 Welcome! Choose an option:", reply_markup=kb)
 
-# === HOSTING TIME CHOICE ===
 @bot.message_handler(func=lambda m: m.text == "💻 Hosting")
 def ask_time(m):
     uid = m.from_user.id
@@ -38,61 +26,60 @@ def ask_time(m):
     kb.add(
         InlineKeyboardButton("⏱ 1 Hour", callback_data="host_60"),
         InlineKeyboardButton("📆 1 Day", callback_data="host_1440"),
-        InlineKeyboardButton("🗓 7 Days", callback_data="host_10080"),
-        InlineKeyboardButton("📅 1 Month", callback_data="host_43200")
     )
-    kb.add(InlineKeyboardButton("🧮 Enter Custom Minutes", callback_data="host_custom"))
-    bot.send_message(m.chat.id, "🕒 Choose hosting time:", reply_markup=kb)
+    kb.add(
+        InlineKeyboardButton("🗓 7 Days", callback_data="host_10080"),
+        InlineKeyboardButton("📅 1 Month", callback_data="host_43200"),
+    )
+    kb.add(InlineKeyboardButton("🧮 Custom Minutes", callback_data="host_custom"))
+    bot.send_message(m.chat.id, "🕒 Select hosting time:", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("host_"))
-def choose_time(call):
+def select_time(call):
     uid = call.from_user.id
-    code = call.data.split("_")[1]
-    if code == "custom":
-        bot.send_message(call.message.chat.id, "✍️ Send custom time in minutes:")
+    value = call.data.split("_")[1]
+    if value == "custom":
         hosting[uid]["step"] = "custom"
+        bot.send_message(call.message.chat.id, "✍️ Send custom time (in minutes):")
     else:
-        mins = int(code)
-        setup_upload_flow(call.message.chat.id, uid, mins)
+        mins = int(value)
+        start_file_upload(call.message.chat.id, uid, mins)
 
 @bot.message_handler(func=lambda m: m.from_user.id in hosting and hosting[m.from_user.id]["step"] == "custom")
-def get_custom_minutes(m):
+def receive_custom_minutes(m):
+    uid = m.from_user.id
     try:
         mins = int(m.text.strip())
-        uid = m.from_user.id
-        setup_upload_flow(m.chat.id, uid, mins)
+        start_file_upload(m.chat.id, uid, mins)
     except:
-        bot.send_message(m.chat.id, "❌ Invalid number. Please send minutes like `30`, `120`, etc.")
+        bot.send_message(m.chat.id, "❌ Invalid number. Please send only numbers like `30`, `120`, etc.")
 
-def setup_upload_flow(chat_id, uid, mins):
-    folder = f"hostings/user_{uid}"
-    os.makedirs(folder, exist_ok=True)
-    hosting[uid].update({
-        "minutes": mins,
-        "step": "upload",
-        "folder": folder,
-        "files": []
-    })
-    bot.send_message(chat_id, f"⏳ Hosting time set: `{mins} minutes`\n\n📤 Now send your `.py` file and extra files (e.g. `username.txt`)\n✅ Type `done` when finished.")
+def start_file_upload(chat_id, uid, mins):
+    folder = make_user_dir(uid)
+    hosting[uid].update({"step": "upload", "minutes": mins, "folder": folder, "files": []})
+    bot.send_message(chat_id, f"⏳ Hosting for `{mins} minutes`\n📤 Send your `.py` and any required files\n✅ Type `done` when you're ready.")
 
 @bot.message_handler(content_types=['document'])
 def save_file(m):
     uid = m.from_user.id
-    if uid not in hosting or hosting[uid].get("step") != "upload":
-        return
+    if uid not in hosting: return
+    step = hosting[uid].get("step")
     folder = hosting[uid]["folder"]
-    fname = m.document.file_name
     file_info = bot.get_file(m.document.file_id)
     data = bot.download_file(file_info.file_path)
-    with open(os.path.join(folder, fname), "wb") as f:
+    file_path = os.path.join(folder, m.document.file_name)
+    with open(file_path, "wb") as f:
         f.write(data)
-    hosting[uid]["files"].append(fname)
-    bot.send_message(m.chat.id, f"✅ Saved `{fname}`")
+    if step == "upload":
+        hosting[uid]["files"].append(m.document.file_name)
+        bot.send_message(m.chat.id, f"✅ Saved `{m.document.file_name}`")
+    elif step == "jwt":
+        handle_jwt_file(m, file_path)
 
 @bot.message_handler(func=lambda m: m.text.lower() == "done")
 def run_script(m):
     uid = m.from_user.id
-    if uid not in hosting or hosting[uid].get("step") != "upload":
+    if uid not in hosting or hosting[uid]["step"] != "upload":
         return
     folder = hosting[uid]["folder"]
     py_files = [f for f in hosting[uid]["files"] if f.endswith(".py")]
@@ -100,33 +87,70 @@ def run_script(m):
         bot.send_message(m.chat.id, "❌ No `.py` file found.")
         return
     main_file = py_files[0]
-    try:
-        bot.send_message(m.chat.id, "🟡 Hosting started...\n🔁 Preparing environment...\n⚙️ Please wait...")
-        proc = subprocess.Popen(["python3", main_file], cwd=folder)
-        end_time = time.time() + hosting[uid]["minutes"] * 60
-        hosting[uid].update({"process": proc, "end": end_time, "step": "running"})
-        bot.send_message(m.chat.id, f"✅ Bot is now running!\n🗓 Will stop after {hosting[uid]['minutes']} minutes.")
-        threading.Thread(target=expire_hosting, args=(uid,), daemon=True).start()
-    except Exception as e:
-        bot.send_message(m.chat.id, f"❌ Error: {e}")
+    main_path = os.path.join(folder, main_file)
 
-def expire_hosting(uid):
-    while time.time() < hosting[uid]["end"]:
-        time.sleep(5)
     try:
-        proc = hosting[uid]["process"]
-        if psutil.pid_exists(proc.pid):
-            proc.kill()
-        folder = hosting[uid]["folder"]
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-        bot.send_message(uid, "⛔ Hosting time ended.\n🗑️ Files deleted and bot stopped.")
+        with open(main_path, 'rb') as f:
+            files = {'file': (main_file, f)}
+            data = {'uid': uid, 'minutes': hosting[uid]['minutes']}
+            r = requests.post(WEBHOOK_URL, data=data, files=files)
+        if r.status_code == 200:
+            result = r.json()
+            output = result.get("output", result.get("error", "No output"))
+            bot.send_message(m.chat.id, f"✅ Hosted via Webhook\n📤 Output:\n```\n{output[:4000]}\n```", parse_mode="Markdown")
+        else:
+            bot.send_message(m.chat.id, f"❌ Webhook Error: {r.status_code}")
     except Exception as e:
-        bot.send_message(uid, f"⚠️ Cleanup error: {e}")
+        bot.send_message(m.chat.id, f"❌ Exception: {e}")
+
+    # Clean up
+    try:
+        shutil.rmtree(folder)
+    except:
+        pass
     hosting.pop(uid, None)
 
-# === LAUNCH WEBHOOK ===
-if __name__ == "__main__":
-    bot.remove_webhook()
-    bot.set_webhook(url=f"{WEBHOOK_URL}/{WEBHOOK_SECRET}")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+# ===== 🔑 JWT TOKEN GENERATOR =====
+@bot.message_handler(func=lambda m: m.text == "🔑 JWT Token Generator")
+def ask_jwt(m):
+    uid = m.from_user.id
+    folder = make_user_dir(uid)
+    hosting[uid] = {"step": "jwt", "folder": folder}
+    bot.send_message(m.chat.id, "📎 Send your `.json` file with UID and Passwords.")
+
+def handle_jwt_file(m, path):
+    uid = m.from_user.id
+    bot.send_message(m.chat.id, "⚙️ Generating tokens...")
+    try:
+        creds = json.load(open(path))
+        output = []
+        log = []
+        for user in creds:
+            uid_val = user.get("uid")
+            pwd = user.get("password")
+            if not uid_val or not pwd:
+                log.append(f"❌ Skipped invalid entry")
+                continue
+            url = f"https://jw-ttoken.vercel.app/token?uid={uid_val}&password={pwd}"
+            try:
+                r = requests.get(url, timeout=10)
+                if r.status_code == 200:
+                    token = r.text.strip()
+                    output.append({"uid": uid_val, "token": token})
+                    log.append(f"✅ {uid_val}")
+                else:
+                    log.append(f"❌ {uid_val} (code {r.status_code})")
+            except:
+                log.append(f"⚠️ {uid_val} (request error)")
+
+        out_path = os.path.join(hosting[uid]["folder"], "tokens.json")
+        with open(out_path, "w") as f:
+            json.dump(output, f, indent=2)
+        bot.send_message(m.chat.id, "\n".join(log[-20:]))
+        bot.send_document(m.chat.id, InputFile(out_path))
+    except Exception as e:
+        bot.send_message(m.chat.id, f"❌ Error: {e}")
+    hosting.pop(uid, None)
+
+# Start polling
+bot.infinity_polling()
